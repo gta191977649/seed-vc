@@ -1,15 +1,10 @@
 import gradio as gr
 import torch
 import yaml
+from modules.device import get_best_device, get_default_dtype
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-
-dtype = torch.float16
+device = get_best_device()
+dtype = get_default_dtype(device)
 def load_models(args):
     from hydra.utils import instantiate
     from omegaconf import DictConfig

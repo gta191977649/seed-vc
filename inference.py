@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -20,20 +21,37 @@ import time
 import torchaudio
 import librosa
 from modules.commons import str2bool
+from modules.device import get_best_device, is_half_precision_enabled, get_default_dtype
 
 from hf_utils import load_custom_model_from_hf
 
 
 # Load model and configuration
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+device = get_best_device()
 
 fp16 = False
+
+
+def _load_lora_adapter(estimator, adapter_path: str):
+    from peft import PeftModel
+
+    adapter_dir = os.path.abspath(adapter_path)
+    if not os.path.isdir(adapter_dir):
+        raise FileNotFoundError(f"LoRA adapter directory not found: {adapter_dir}")
+    wrapped_estimator = PeftModel.from_pretrained(
+        estimator,
+        adapter_dir,
+        is_trainable=False,
+    )
+    wrapped_estimator.eval()
+    return wrapped_estimator
+
+
+def _setup_estimator_caches(estimator, max_batch_size: int, max_seq_length: int) -> None:
+    base_estimator = estimator.get_base_model() if hasattr(estimator, "get_base_model") else estimator
+    base_estimator.setup_caches(max_batch_size=max_batch_size, max_seq_length=max_seq_length)
+
+
 def load_models(args):
     global fp16
     fp16 = args.fp16
@@ -77,10 +95,12 @@ def load_models(args):
         ignore_modules=[],
         is_distributed=False,
     )
+    if args.lora_adapter:
+        model.cfm.estimator = _load_lora_adapter(model.cfm.estimator, args.lora_adapter)
     for key in model:
         model[key].eval()
         model[key].to(device)
-    model.cfm.estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+    _setup_estimator_caches(model.cfm.estimator, max_batch_size=1, max_seq_length=8192)
 
     # Load additional modules
     from modules.campplus.DTDNN import CAMPPlus
@@ -134,7 +154,8 @@ def load_models(args):
         # whisper
         from transformers import AutoFeatureExtractor, WhisperModel
         whisper_name = model_params.speech_tokenizer.name
-        whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(device)
+        whisper_dtype = get_default_dtype(device, prefer_half=fp16)
+        whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=whisper_dtype).to(device)
         del whisper_model.decoder
         whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
 
@@ -165,7 +186,8 @@ def load_models(args):
         hubert_model = HubertModel.from_pretrained(hubert_model_name)
         hubert_model = hubert_model.to(device)
         hubert_model = hubert_model.eval()
-        hubert_model = hubert_model.half()
+        if fp16:
+            hubert_model = hubert_model.half()
 
         def semantic_fn(waves_16k):
             ori_waves_16k_input_list = [
@@ -179,7 +201,7 @@ def load_models(args):
                                                   sampling_rate=16000).to(device)
             with torch.no_grad():
                 ori_outputs = hubert_model(
-                    ori_inputs.input_values.half(),
+                    ori_inputs.input_values.half() if fp16 else ori_inputs.input_values.float(),
                 )
             S_ori = ori_outputs.last_hidden_state.float()
             return S_ori
@@ -195,7 +217,8 @@ def load_models(args):
         wav2vec_model.encoder.layers = wav2vec_model.encoder.layers[:output_layer]
         wav2vec_model = wav2vec_model.to(device)
         wav2vec_model = wav2vec_model.eval()
-        wav2vec_model = wav2vec_model.half()
+        if fp16:
+            wav2vec_model = wav2vec_model.half()
 
         def semantic_fn(waves_16k):
             ori_waves_16k_input_list = [
@@ -209,7 +232,7 @@ def load_models(args):
                                                    sampling_rate=16000).to(device)
             with torch.no_grad():
                 ori_outputs = wav2vec_model(
-                    ori_inputs.input_values.half(),
+                    ori_inputs.input_values.half() if fp16 else ori_inputs.input_values.float(),
                 )
             S_ori = ori_outputs.last_hidden_state.float()
             return S_ori
@@ -368,7 +391,8 @@ def main(args):
         chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
         is_last_chunk = processed_frames + max_source_window >= cond.size(1)
         cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+        autocast_context = torch.autocast(device_type=device.type, dtype=torch.float16) if fp16 else nullcontext()
+        with autocast_context:
             # Voice Conversion
             vc_target = model.cfm.inference(cat_condition,
                                                        torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
@@ -420,6 +444,9 @@ if __name__ == "__main__":
     parser.add_argument("--semi-tone-shift", type=int, default=0)
     parser.add_argument("--checkpoint", type=str, help="Path to the checkpoint file", default=None)
     parser.add_argument("--config", type=str, help="Path to the config file", default=None)
-    parser.add_argument("--fp16", type=str2bool, default=True)
+    parser.add_argument("--fp16", type=str2bool, default=None)
+    parser.add_argument("--lora-adapter", type=str, default="")
     args = parser.parse_args()
+    if args.fp16 is None:
+        args.fp16 = is_half_precision_enabled(device)
     main(args)

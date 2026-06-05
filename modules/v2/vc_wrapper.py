@@ -2,8 +2,10 @@ import torch
 import librosa
 import torchaudio
 import numpy as np
+from contextlib import nullcontext
 from pydub import AudioSegment
 from hf_utils import load_custom_model_from_hf
+from modules.device import get_best_device, get_default_dtype
 
 DEFAULT_REPO_ID = "Plachta/Seed-VC"
 DEFAULT_CFM_CHECKPOINT = "v2/cfm_small.pth"
@@ -121,6 +123,12 @@ class VoiceConversionWrapper(torch.nn.Module):
             mode="reduce-overhead" if torch.cuda.is_available() else None,
         )
         self.dit_compiled = True
+
+    @staticmethod
+    def _autocast_context(device: torch.device, dtype: torch.dtype):
+        if dtype == torch.float32:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, dtype=dtype)
 
     @staticmethod
     def strip_prefix(state_dict: dict, prefix: str = "module.") -> dict:
@@ -341,9 +349,11 @@ class VoiceConversionWrapper(torch.nn.Module):
             inference_cfg_rate: float = 0.5,
             use_sway_sampling: bool = False,
             use_amo_sampling: bool = False,
-            device: torch.device = torch.device("cpu"),
-            dtype: torch.dtype = torch.float32,
+            device: torch.device | None = None,
+            dtype: torch.dtype | None = None,
     ):
+        device = device or get_best_device()
+        dtype = dtype or get_default_dtype(device)
         source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
         target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
         source_wave_tensor = torch.tensor(source_wave).unsqueeze(0).to(device)
@@ -361,7 +371,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         source_mel_len = source_mel.size(2)
         target_mel_len = target_mel.size(2)
 
-        with torch.autocast(device_type=device.type, dtype=dtype):
+        with self._autocast_context(device, dtype):
             # compute content features
             _, source_content_indices, _ = self.content_extractor_wide(source_wave_16k_tensor, [source_wave_16k.size])
             _, target_content_indices, _ = self.content_extractor_wide(target_wave_16k_tensor, [target_wave_16k.size])
@@ -401,9 +411,11 @@ class VoiceConversionWrapper(torch.nn.Module):
             repetition_penalty: float = 1.5,
             use_sway_sampling: bool = False,
             use_amo_sampling: bool = False,
-            device: torch.device = torch.device("cpu"),
-            dtype: torch.dtype = torch.float32,
+            device: torch.device | None = None,
+            dtype: torch.dtype | None = None,
     ):
+        device = device or get_best_device()
+        dtype = dtype or get_default_dtype(device)
         source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
         target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
         source_wave_tensor = torch.tensor(source_wave).unsqueeze(0).to(device)
@@ -421,7 +433,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         source_mel_len = source_mel.size(2)
         target_mel_len = target_mel.size(2)
 
-        with torch.autocast(device_type=device.type, dtype=dtype):
+        with self._autocast_context(device, dtype):
             # compute content features
             _, source_content_indices, _ = self.content_extractor_wide(source_wave_16k_tensor, [source_wave_16k.size])
             _, target_content_indices, _ = self.content_extractor_wide(target_wave_16k_tensor, [target_wave_16k.size])
@@ -505,8 +517,8 @@ class VoiceConversionWrapper(torch.nn.Module):
             repetition_penalty: float = 1.5,
             convert_style: bool = False,
             anonymization_only: bool = False,
-            device: torch.device = torch.device("cuda"),
-            dtype: torch.dtype = torch.float16,
+            device: torch.device | None = None,
+            dtype: torch.dtype | None = None,
             stream_output: bool = True,
     ):
         """
@@ -530,6 +542,9 @@ class VoiceConversionWrapper(torch.nn.Module):
             If stream_output is True, yields (mp3_bytes, full_audio) tuples
             If stream_output is False, returns the full audio as a numpy array
         """
+        device = device or get_best_device()
+        dtype = dtype or get_default_dtype(device)
+
         # Load audio
         source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
         target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
@@ -556,7 +571,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         max_context_window = self.sr // self.hop_size * self.dit_max_context_len
         overlap_wave_len = self.overlap_frame_len * self.hop_size
         
-        with torch.autocast(device_type=device.type, dtype=dtype):
+        with self._autocast_context(device, dtype):
             # Compute content features
             source_content_indices = self._process_content_features(source_wave_16k_tensor, is_narrow=False)
             target_content_indices = self._process_content_features(target_wave_16k_tensor, is_narrow=False)
@@ -570,7 +585,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         processed_frames = 0
         previous_chunk = None
         if convert_style:
-            with torch.autocast(device_type=device.type, dtype=dtype):
+            with self._autocast_context(device, dtype):
                 source_narrow_indices = self._process_content_features(source_wave_16k_tensor, is_narrow=True)
                 target_narrow_indices = self._process_content_features(target_wave_16k_tensor, is_narrow=True)
             src_narrow_reduced, src_narrow_len = self.duration_reduction_func(source_narrow_indices[0], 1)
@@ -581,7 +596,7 @@ class VoiceConversionWrapper(torch.nn.Module):
             # Process src_narrow_reduced in chunks
             for i in range(0, len(src_narrow_reduced), max_chunk_size):
                 is_last_chunk = i + max_chunk_size >= len(src_narrow_reduced)
-                with torch.autocast(device_type=device.type, dtype=dtype):
+                with self._autocast_context(device, dtype):
                     chunk = src_narrow_reduced[i:i + max_chunk_size]
                     if anonymization_only:
                         chunk_ar_cond = self.ar_length_regulator(chunk[None])[0]

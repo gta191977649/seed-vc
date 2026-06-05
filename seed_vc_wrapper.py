@@ -2,6 +2,7 @@ import torch
 import torchaudio
 import librosa
 import numpy as np
+from contextlib import nullcontext
 from pydub import AudioSegment
 import yaml
 from modules.commons import build_model, load_checkpoint, recursive_munch
@@ -11,6 +12,7 @@ from modules.bigvgan import bigvgan
 from modules.audio import mel_spectrogram
 from modules.rmvpe import RMVPE
 from transformers import AutoFeatureExtractor, WhisperModel
+from modules.device import get_best_device, get_default_dtype, is_half_precision_enabled
 
 class SeedVCWrapper:
     def __init__(self, device=None):
@@ -22,12 +24,7 @@ class SeedVCWrapper:
         """
         # Set device
         if device is None:
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                self.device = torch.device("mps")
-            else:
-                self.device = torch.device("cpu")
+            self.device = get_best_device()
         else:
             self.device = device
             
@@ -82,7 +79,8 @@ class SeedVCWrapper:
         
         # Load whisper model
         whisper_name = model_params.speech_tokenizer.whisper_name if hasattr(model_params.speech_tokenizer, 'whisper_name') else "openai/whisper-small"
-        self.whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(self.device)
+        whisper_dtype = get_default_dtype(self.device)
+        self.whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=whisper_dtype).to(self.device)
         del self.whisper_model.decoder
         self.whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
         
@@ -430,7 +428,8 @@ class SeedVCWrapper:
             is_last_chunk = processed_frames + max_source_window >= cond.size(1)
             cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
             
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+            autocast_context = torch.autocast(device_type=self.device.type, dtype=torch.float16) if is_half_precision_enabled(self.device) else nullcontext()
+            with autocast_context:
                 # Voice Conversion
                 vc_target = inference_module.cfm.inference(
                     cat_condition,

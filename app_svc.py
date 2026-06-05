@@ -1,5 +1,6 @@
 import os
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+from contextlib import nullcontext
 import gradio as gr
 import torch
 import torchaudio
@@ -10,6 +11,7 @@ from hf_utils import load_custom_model_from_hf
 import numpy as np
 from pydub import AudioSegment
 import argparse
+from modules.device import get_best_device, get_default_dtype, is_half_precision_enabled
 # Load model and configuration
 
 fp16 = False
@@ -101,7 +103,8 @@ def load_models(args):
         # whisper
         from transformers import AutoFeatureExtractor, WhisperModel
         whisper_name = model_params.speech_tokenizer.name
-        whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=torch.float16).to(device)
+        whisper_dtype = get_default_dtype(device, prefer_half=fp16)
+        whisper_model = WhisperModel.from_pretrained(whisper_name, torch_dtype=whisper_dtype).to(device)
         del whisper_model.decoder
         whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_name)
 
@@ -132,7 +135,8 @@ def load_models(args):
         hubert_model = HubertModel.from_pretrained(hubert_model_name)
         hubert_model = hubert_model.to(device)
         hubert_model = hubert_model.eval()
-        hubert_model = hubert_model.half()
+        if fp16:
+            hubert_model = hubert_model.half()
 
         def semantic_fn(waves_16k):
             ori_waves_16k_input_list = [
@@ -146,7 +150,7 @@ def load_models(args):
                                                   sampling_rate=16000).to(device)
             with torch.no_grad():
                 ori_outputs = hubert_model(
-                    ori_inputs.input_values.half(),
+                    ori_inputs.input_values.half() if fp16 else ori_inputs.input_values.float(),
                 )
             S_ori = ori_outputs.last_hidden_state.float()
             return S_ori
@@ -162,7 +166,8 @@ def load_models(args):
         wav2vec_model.encoder.layers = wav2vec_model.encoder.layers[:output_layer]
         wav2vec_model = wav2vec_model.to(device)
         wav2vec_model = wav2vec_model.eval()
-        wav2vec_model = wav2vec_model.half()
+        if fp16:
+            wav2vec_model = wav2vec_model.half()
 
         def semantic_fn(waves_16k):
             ori_waves_16k_input_list = [
@@ -176,7 +181,7 @@ def load_models(args):
                                                    sampling_rate=16000).to(device)
             with torch.no_grad():
                 ori_outputs = wav2vec_model(
-                    ori_inputs.input_values.half(),
+                    ori_inputs.input_values.half() if fp16 else ori_inputs.input_values.float(),
                 )
             S_ori = ori_outputs.last_hidden_state.float()
             return S_ori
@@ -333,7 +338,8 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         chunk_f0 = interpolated_shifted_f0_alt[:, processed_frames:processed_frames + max_source_window]
         is_last_chunk = processed_frames + max_source_window >= cond.size(1)
         cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+        autocast_context = torch.autocast(device_type=device.type, dtype=torch.float16) if fp16 else nullcontext()
+        with autocast_context:
             # Voice Conversion
             vc_target = inference_module.cfm.inference(cat_condition,
                                                        torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
@@ -436,15 +442,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, help="Path to the checkpoint file", default=None)
     parser.add_argument("--config", type=str, help="Path to the config file", default=None)
     parser.add_argument("--share", type=str2bool, nargs="?", const=True, default=False, help="Whether to share the app")
-    parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True)
+    parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=None)
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
-    cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda" 
-
-    if torch.cuda.is_available():
-        device = torch.device(cuda_target)
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device = get_best_device(args.gpu)
+    if args.fp16 is None:
+        args.fp16 = is_half_precision_enabled(device)
     main(args)
